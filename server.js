@@ -58,13 +58,17 @@ app.post('/api/', async (req, res) => {
         }
 
         // prompt.md のテンプレート変数 ${key} をリクエストの値で置換する
-        const finalPrompt = fillTemplate(promptTemplate, variables);
+        const isMalatangRequest = ["初級", "中級", "上級"].includes(variables.difficulty);
+        const selectedPrompt = isMalatangRequest
+            ? fs.readFileSync('prompt-malatang.md', 'utf8')
+            : promptTemplate;
+        const finalPrompt = fillTemplate(selectedPrompt, variables);
 
         let result;
         if (PROVIDER === 'openai') {
-            result = await callOpenAI(finalPrompt);
+            result = await callOpenAI(finalPrompt, isMalatangRequest);
         } else if (PROVIDER === 'gemini') {
-            result = await callGemini(finalPrompt);
+            result = await callGemini(finalPrompt, isMalatangRequest);
         } else {
             return res.status(400).json({ error: 'Invalid provider configuration' });
         }
@@ -90,7 +94,7 @@ function fillTemplate(template, variables) {
     });
 }
 
-async function callOpenAI(prompt) {
+async function callOpenAI(prompt, preserveObject = false) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
         throw new Error('OPENAI_API_KEY environment variable is not set');
@@ -119,10 +123,10 @@ async function callOpenAI(prompt) {
 
     const data = await response.json();
     const responseText = data.choices[0].message.content;
-    return extractArray(responseText);
+    return preserveObject ? parseGeneratedObject(responseText) : extractArray(responseText);
 }
 
-async function callGemini(prompt) {
+async function callGemini(prompt, preserveObject = false) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
         throw new Error('GEMINI_API_KEY environment variable is not set');
@@ -154,7 +158,66 @@ async function callGemini(prompt) {
 
     const data = await response.json();
     const responseText = data.candidates[0].content.parts[0].text;
-    return extractArray(responseText);
+    return preserveObject ? parseGeneratedObject(responseText) : extractArray(responseText);
+}
+
+// 麻辣湯では目標金額などを含むオブジェクト全体をクライアントへ渡す。
+function parseGeneratedObject(responseText) {
+    let parsedData;
+    try {
+        parsedData = JSON.parse(responseText);
+    } catch (parseError) {
+        throw new Error('Failed to parse LLM response: ' + parseError.message);
+    }
+
+    if (!parsedData || typeof parsedData !== 'object' || Array.isArray(parsedData) || !Array.isArray(parsedData.ingredients)) {
+        throw new Error('The LLM response must be an object with an ingredients array.');
+    }
+
+    return ensureReachableTarget(parsedData);
+}
+
+// AIの目標金額が具材価格で作れない場合だけ、800〜2000円で最も近い到達可能額に補正する。
+function ensureReachableTarget(data) {
+    const prices = data.ingredients
+        .map((item) => Number(item.price))
+        .filter((price) => Number.isInteger(price) && price > 0);
+    if (prices.length === 0) {
+        throw new Error('The LLM response does not contain valid ingredient prices.');
+    }
+
+    const originalTarget = Number(data.targetPrice);
+    const target = Number.isInteger(originalTarget) && originalTarget >= 800 && originalTarget <= 2000
+        ? originalTarget
+        : 1400;
+    const reachable = new Set([0]);
+
+    // 同じ具材を複数回追加できるため、無制限ナップサックで到達額を調べる。
+    for (let amount = 1; amount <= 2000; amount += 1) {
+        if (prices.some((price) => amount >= price && reachable.has(amount - price))) {
+            reachable.add(amount);
+        }
+    }
+
+    if (reachable.has(target)) {
+        data.targetPrice = target;
+        return data;
+    }
+
+    let nearestTarget = null;
+    for (let amount = 800; amount <= 2000; amount += 1) {
+        if (!reachable.has(amount)) continue;
+        if (nearestTarget === null || Math.abs(amount - target) < Math.abs(nearestTarget - target)) {
+            nearestTarget = amount;
+        }
+    }
+
+    if (nearestTarget === null) {
+        throw new Error('Could not create a reachable target price.');
+    }
+
+    data.targetPrice = nearestTarget;
+    return data;
 }
 
 // LLM が返した JSON 文字列をパースし、最初に見つかった配列を取り出す
